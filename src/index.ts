@@ -2,7 +2,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import fetch, { type Response } from "node-fetch";
+import fetch, { type Response, FormData, fileFromSync } from "node-fetch";
+import { existsSync, statSync } from "node:fs";
+import { basename, extname } from "node:path";
 
 // Debug logging helper - writes to stderr
 const debugLog = (...args: unknown[]) => {
@@ -19,6 +21,10 @@ debugLog("Current directory:", process.cwd());
 
 const API_BASE_URL = "https://api.raindrop.io/rest/v1";
 const AUTH_TOKEN = process.env.RAINDROP_TOKEN || "test-token-for-testing";
+
+// Special collection IDs
+const TRASH_COLLECTION_ID = -99;
+const UNSORTED_COLLECTION_ID = -1;
 
 debugLog("Checking for RAINDROP_TOKEN...");
 debugLog("RAINDROP_TOKEN present:", !!process.env.RAINDROP_TOKEN);
@@ -474,6 +480,106 @@ const checkUrlExistsSchema = {
   urls: z.array(z.string()).describe("URLs to check"),
 };
 
+// ==========================================================================
+// NEW SCHEMAS - Extended functionality
+// ==========================================================================
+
+const uploadFileSchema = {
+  filePath: z.string().describe("Absolute path to the file to upload (PDF, image, or video)"),
+  collectionId: z.number().optional().describe("Collection ID to add the file to (default: -1 for Unsorted)"),
+  title: z.string().optional().describe("Custom title for the bookmark (defaults to filename)"),
+  tags: tagsArraySchema.describe("Tags for the uploaded file"),
+  minimal: minimalSchema.describe("Return minimal response (just 'ok') to save space"),
+};
+
+const setReminderSchema = {
+  raindropId: z.number().describe("Raindrop ID to set reminder on"),
+  reminderDate: z.string().describe("Reminder date in ISO-8601 format (e.g., '2024-12-31T09:00:00Z')"),
+  minimal: minimalSchema.describe("Return minimal response (just 'ok') to save space"),
+};
+
+const removeReminderSchema = {
+  raindropId: z.number().describe("Raindrop ID to remove reminder from"),
+  minimal: minimalSchema.describe("Return minimal response (just 'ok') to save space"),
+};
+
+const highlightColorSchema = z.enum([
+  "blue", "brown", "cyan", "gray", "green", "indigo",
+  "orange", "pink", "purple", "red", "teal", "yellow"
+]).optional();
+
+const createHighlightSchema = {
+  raindropId: z.number().describe("Raindrop ID to add highlight to"),
+  text: z.string().min(1).describe("The highlighted text"),
+  color: highlightColorSchema.describe("Highlight color (default: yellow)"),
+  note: z.string().optional().describe("Optional note/annotation for the highlight"),
+  minimal: minimalSchema.describe("Return minimal response (just 'ok') to save space"),
+};
+
+const updateHighlightSchema = {
+  raindropId: z.number().describe("Raindrop ID containing the highlight"),
+  highlightId: z.string().describe("Highlight ID to update"),
+  text: z.string().optional().describe("New highlighted text"),
+  color: highlightColorSchema.describe("New highlight color"),
+  note: z.string().optional().describe("New note (use empty string to clear)"),
+  minimal: minimalSchema.describe("Return minimal response (just 'ok') to save space"),
+};
+
+const deleteHighlightSchema = {
+  raindropId: z.number().describe("Raindrop ID containing the highlight"),
+  highlightId: z.string().describe("Highlight ID to delete"),
+  minimal: minimalSchema.describe("Return minimal response (just 'ok') to save space"),
+};
+
+const listTrashSchema = {
+  page: paginationSchemas.page.describe("Page number (starts from 0)"),
+  perpage: paginationSchemas.perpage.describe("Items per page (max 50)"),
+  fields: fieldPresetOrArraySchema.describe("Field selection: Use preset or array of field names"),
+};
+
+const emptyTrashSchema = {
+  confirm: z.literal(true).describe("Must be true to confirm permanent deletion. This action is IRREVERSIBLE."),
+};
+
+const moveToTrashSchema = {
+  raindropId: z.number().describe("Raindrop ID to move to trash"),
+  minimal: minimalSchema.describe("Return minimal response (just 'ok') to save space"),
+};
+
+const restoreFromTrashSchema = {
+  raindropId: z.number().describe("Raindrop ID to restore from trash"),
+  targetCollectionId: z.number().optional().describe("Collection to restore to (default: -1 for Unsorted)"),
+  minimal: minimalSchema.describe("Return minimal response (just 'ok') to save space"),
+};
+
+const exportCollectionSchema = {
+  collectionId: z.number().describe("Collection ID to export (use 0 for all bookmarks)"),
+  format: z.enum(["csv", "html"]).default("html").describe("Export format: 'csv' or 'html' (default: html)"),
+};
+
+const createBackupSchema = {
+  // No parameters - triggers async backup that sends email notification
+};
+
+const listBackupsSchema = {
+  // No parameters - returns list of available backups
+};
+
+const importBookmarksFileSchema = {
+  filePath: z.string().describe("Absolute path to the HTML bookmark file to import"),
+  collectionId: z.number().optional().describe("Collection ID to import bookmarks into (default: creates new collections)"),
+};
+
+const getCacheSchema = {
+  raindropId: z.number().describe("Raindrop ID to get cached page URL for"),
+};
+
+const watchCollectionSchema = {
+  collectionId: z.number().describe("Collection ID to watch for new items"),
+  since: z.string().optional().describe("ISO-8601 timestamp to check for items created after (defaults to last watch time)"),
+  resetWatch: z.boolean().optional().describe("Reset the watch timestamp to now (useful for starting fresh)"),
+};
+
 // Parameter types for tool handlers
 interface ListCollectionsParams {
   root: boolean;
@@ -616,6 +722,131 @@ interface ParseUrlParams {
 interface CheckUrlExistsParams {
   urls: string[];
 }
+
+// ==========================================================================
+// NEW INTERFACES - Extended functionality
+// ==========================================================================
+
+interface UploadFileParams {
+  filePath: string;
+  collectionId?: number;
+  title?: string;
+  tags?: string[];
+  minimal: boolean;
+}
+
+interface SetReminderParams {
+  raindropId: number;
+  reminderDate: string;
+  minimal: boolean;
+}
+
+interface RemoveReminderParams {
+  raindropId: number;
+  minimal: boolean;
+}
+
+type HighlightColor = "blue" | "brown" | "cyan" | "gray" | "green" | "indigo" |
+  "orange" | "pink" | "purple" | "red" | "teal" | "yellow";
+
+interface CreateHighlightParams {
+  raindropId: number;
+  text: string;
+  color?: HighlightColor;
+  note?: string;
+  minimal: boolean;
+}
+
+interface UpdateHighlightParams {
+  raindropId: number;
+  highlightId: string;
+  text?: string;
+  color?: HighlightColor;
+  note?: string;
+  minimal: boolean;
+}
+
+interface DeleteHighlightParams {
+  raindropId: number;
+  highlightId: string;
+  minimal: boolean;
+}
+
+interface ListTrashParams {
+  page: number;
+  perpage: number;
+  fields?: string[] | FieldPreset;
+}
+
+interface EmptyTrashParams {
+  confirm: true;
+}
+
+interface MoveToTrashParams {
+  raindropId: number;
+  minimal: boolean;
+}
+
+interface RestoreFromTrashParams {
+  raindropId: number;
+  targetCollectionId?: number;
+  minimal: boolean;
+}
+
+interface ExportCollectionParams {
+  collectionId: number;
+  format: "csv" | "html";
+}
+
+interface ImportBookmarksFileParams {
+  filePath: string;
+  collectionId?: number;
+}
+
+// Response types for import/export
+interface BackupItem {
+  _id: string;
+  created: string;
+  [key: string]: unknown;
+}
+
+interface BackupsResponse {
+  result: boolean;
+  items: BackupItem[];
+  [key: string]: unknown;
+}
+
+interface ImportResponse {
+  result: boolean;
+  items?: Array<{ _id: number; title: string; link: string }>;
+  [key: string]: unknown;
+}
+
+interface GetCacheParams {
+  raindropId: number;
+}
+
+interface WatchCollectionParams {
+  collectionId: number;
+  since?: string;
+  resetWatch?: boolean;
+}
+
+interface CacheResponse {
+  url: string;
+  status: string;
+}
+
+interface WatchResult {
+  collectionId: number;
+  since: string;
+  until: string;
+  newItems: Raindrop[];
+  count: number;
+}
+
+// Module-level watch timestamps storage
+const watchTimestamps = new Map<number, string>();
 
 // ============================================================================
 // RAINDROP API CLIENT
@@ -786,6 +1017,286 @@ class RaindropClient {
       method: "POST",
       body: JSON.stringify({ urls })
     });
+  }
+
+  // ==========================================================================
+  // NEW METHODS - Extended functionality
+  // ==========================================================================
+
+  // File Upload API (Pro feature)
+  async uploadFile(
+    filePath: string,
+    collectionId?: number
+  ): Promise<RaindropResponse> {
+    // Validate file exists
+    if (!existsSync(filePath)) {
+      throw new Error(`File not found: ${filePath}`);
+    }
+
+    const stats = statSync(filePath);
+    const maxSize = 300 * 1024 * 1024; // 300MB limit for Pro
+    if (stats.size > maxSize) {
+      throw new Error(`File too large: ${stats.size} bytes (max ${maxSize} bytes)`);
+    }
+
+    // Determine content type from extension
+    const ext = extname(filePath).toLowerCase();
+    const mimeTypes: Record<string, string> = {
+      ".pdf": "application/pdf",
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".gif": "image/gif",
+      ".webp": "image/webp",
+      ".mp4": "video/mp4",
+      ".mov": "video/quicktime",
+      ".webm": "video/webm",
+    };
+
+    const contentType = mimeTypes[ext];
+    if (!contentType) {
+      throw new Error(`Unsupported file type: ${ext}. Supported: ${Object.keys(mimeTypes).join(", ")}`);
+    }
+
+    // Build multipart form data
+    const form = new FormData();
+    const file = fileFromSync(filePath, contentType);
+    form.append("file", file, basename(filePath));
+
+    if (collectionId !== undefined) {
+      form.append("collectionId", String(collectionId));
+    }
+
+    // Make request with multipart/form-data (no Content-Type header - let fetch set it)
+    const fetchFn = (globalThis.fetch as unknown as typeof fetch) || fetch;
+    const response = await fetchFn(`${API_BASE_URL}/raindrop/file`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${AUTH_TOKEN}`,
+      },
+      body: form,
+    });
+
+    return this.handleResponse<RaindropResponse>(response as Response);
+  }
+
+  // Highlights API (modifies raindrop's highlights array)
+  async createHighlight(
+    raindropId: number,
+    text: string,
+    color?: string,
+    note?: string
+  ): Promise<RaindropResponse> {
+    // Get current raindrop with highlights
+    const raindrop = await this.getRaindrop(raindropId);
+    const existingHighlights = (raindrop.item.highlights as Highlight[]) || [];
+
+    // Create new highlight
+    const newHighlight: Partial<Highlight> = {
+      text,
+      color: color || "yellow",
+      note: note || "",
+    };
+
+    // Append and update
+    const updatedHighlights = [...existingHighlights, newHighlight];
+    return this.updateRaindrop(raindropId, { highlights: updatedHighlights } as Partial<Raindrop>);
+  }
+
+  async updateHighlight(
+    raindropId: number,
+    highlightId: string,
+    updates: { text?: string; color?: string; note?: string }
+  ): Promise<RaindropResponse> {
+    // Get current raindrop with highlights
+    const raindrop = await this.getRaindrop(raindropId);
+    const existingHighlights = (raindrop.item.highlights as Highlight[]) || [];
+
+    // Find and update the highlight
+    const highlightIndex = existingHighlights.findIndex(h => h._id === highlightId);
+    if (highlightIndex === -1) {
+      throw new Error(`Highlight with ID '${highlightId}' not found in raindrop ${raindropId}`);
+    }
+
+    const updatedHighlight = { ...existingHighlights[highlightIndex] };
+    if (updates.text !== undefined) {updatedHighlight.text = updates.text;}
+    if (updates.color !== undefined) {updatedHighlight.color = updates.color;}
+    if (updates.note !== undefined) {updatedHighlight.note = updates.note;}
+
+    const updatedHighlights = [...existingHighlights];
+    updatedHighlights[highlightIndex] = updatedHighlight;
+
+    return this.updateRaindrop(raindropId, { highlights: updatedHighlights } as Partial<Raindrop>);
+  }
+
+  async deleteHighlight(
+    raindropId: number,
+    highlightId: string
+  ): Promise<RaindropResponse> {
+    // Get current raindrop with highlights
+    const raindrop = await this.getRaindrop(raindropId);
+    const existingHighlights = (raindrop.item.highlights as Highlight[]) || [];
+
+    // Find the highlight - Raindrop.io deletes by setting text to empty string
+    const highlightIndex = existingHighlights.findIndex(h => h._id === highlightId);
+    if (highlightIndex === -1) {
+      throw new Error(`Highlight with ID '${highlightId}' not found in raindrop ${raindropId}`);
+    }
+
+    // Set text to empty to trigger deletion
+    const updatedHighlights = [...existingHighlights];
+    updatedHighlights[highlightIndex] = { ...updatedHighlights[highlightIndex], text: "" };
+
+    return this.updateRaindrop(raindropId, { highlights: updatedHighlights } as Partial<Raindrop>);
+  }
+
+  // Trash API
+  async emptyTrash(): Promise<{ result: boolean }> {
+    return this.request<{ result: boolean }>(this.buildUrl(`/collection/${TRASH_COLLECTION_ID}`), {
+      method: "DELETE"
+    });
+  }
+
+  // Export API
+  async exportCollection(collectionId: number, format: "csv" | "html" = "html"): Promise<string> {
+    const url = `${API_BASE_URL}/raindrops/${collectionId}/export.${format}`;
+    const fetchFn = (globalThis.fetch as unknown as typeof fetch) || fetch;
+    const response = await fetchFn(url, {
+      headers: this.headers
+    });
+
+    if (!response.ok) {
+      throw new Error(`Export failed: ${response.status} ${response.statusText}`);
+    }
+
+    // Return the content as text (CSV or HTML)
+    return await response.text();
+  }
+
+  // Backup API
+  async createBackup(): Promise<{ result: boolean }> {
+    return this.request<{ result: boolean }>(this.buildUrl("/backup"));
+  }
+
+  async listBackups(): Promise<BackupsResponse> {
+    return this.request<BackupsResponse>(this.buildUrl("/backups"));
+  }
+
+  // Import API
+  async importBookmarksFile(filePath: string, collectionId?: number): Promise<ImportResponse> {
+    // Validate file exists
+    if (!existsSync(filePath)) {
+      throw new Error(`File not found: ${filePath}`);
+    }
+
+    // Build multipart form data
+    const form = new FormData();
+    const file = fileFromSync(filePath, "text/html");
+    form.append("import", file, basename(filePath));
+
+    if (collectionId !== undefined) {
+      form.append("collectionId", String(collectionId));
+    }
+
+    // Make request
+    const fetchFn = (globalThis.fetch as unknown as typeof fetch) || fetch;
+    const response = await fetchFn(`${API_BASE_URL}/import/file`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${AUTH_TOKEN}`,
+      },
+      body: form,
+    });
+
+    return this.handleResponse<ImportResponse>(response as Response);
+  }
+
+  // Cache API (Pro feature)
+  async getCacheUrl(raindropId: number): Promise<CacheResponse> {
+    // First, get the raindrop to check cache status
+    const raindrop = await this.getRaindrop(raindropId);
+    const cache = raindrop.item.cache as { status?: string } | undefined;
+
+    if (!cache || cache.status !== "ready") {
+      throw new Error(
+        `Cache not available for raindrop ${raindropId}. ` +
+        `Status: ${cache?.status || "not found"}. ` +
+        "Permanent copy must be enabled and ready for this bookmark."
+      );
+    }
+
+    // Get the cache URL by following the redirect
+    const url = `${API_BASE_URL}/raindrop/${raindropId}/cache`;
+    const fetchFn = (globalThis.fetch as unknown as typeof fetch) || fetch;
+    const response = await fetchFn(url, {
+      headers: {
+        Authorization: `Bearer ${AUTH_TOKEN}`,
+      },
+      redirect: "manual", // Don't follow redirect, we want the Location header
+    });
+
+    // 307 redirect contains the S3 URL in Location header
+    if (response.status === 307) {
+      const location = response.headers.get("Location");
+      if (location) {
+        return { url: location, status: "ready" };
+      }
+    }
+
+    throw new Error(`Unexpected response when getting cache URL: ${response.status}`);
+  }
+
+  // Watch API (simulated webhooks via polling)
+  async watchCollection(
+    collectionId: number,
+    since?: string,
+    resetWatch?: boolean
+  ): Promise<WatchResult> {
+    const now = new Date().toISOString();
+
+    // Get the timestamp to check from
+    let checkSince: string;
+    if (resetWatch) {
+      // Reset watch - just update timestamp and return empty
+      watchTimestamps.set(collectionId, now);
+      return {
+        collectionId,
+        since: now,
+        until: now,
+        newItems: [],
+        count: 0
+      };
+    } else if (since) {
+      // Use provided timestamp
+      checkSince = since;
+    } else {
+      // Use stored timestamp or default to now (first watch returns nothing)
+      checkSince = watchTimestamps.get(collectionId) || now;
+    }
+
+    // Fetch recent items sorted by creation date (newest first)
+    const result = await this.getRaindrops(collectionId, {
+      sort: "-created" as JsonPrimitive,
+      perpage: 50 as JsonPrimitive,
+    });
+
+    // Filter to items created after checkSince
+    const sinceDate = new Date(checkSince);
+    const newItems = result.items.filter(item => {
+      const created = item.created ? new Date(item.created) : null;
+      return created && created > sinceDate;
+    });
+
+    // Update stored timestamp
+    watchTimestamps.set(collectionId, now);
+
+    return {
+      collectionId,
+      since: checkSince,
+      until: now,
+      newItems,
+      count: newItems.length
+    };
   }
 }
 
@@ -1266,6 +1777,276 @@ server.registerTool(
   },
   toolHandler<CheckUrlExistsParams>(async ({ urls }) => {
     const result = await client.checkUrlExists(urls);
+    return createJsonResponse(result as unknown as JsonValue);
+  })
+);
+
+// ============================================================================
+// FILE UPLOAD TOOLS (Pro feature)
+// ============================================================================
+
+server.registerTool(
+  "upload-file",
+  {
+    title: "Upload File",
+    description: "Upload a file (PDF, image, or video) directly to Raindrop.io as a bookmark. Pro feature with 300MB max file size and 10GB/month limit. Supported formats: PDF, PNG, JPG, GIF, WebP, MP4, MOV, WebM. The file becomes permanently stored and accessible through Raindrop.io.",
+    inputSchema: uploadFileSchema,
+  },
+  toolHandler<UploadFileParams>(async ({ filePath, collectionId, title, tags, minimal }) => {
+    // Upload the file
+    const result = await client.uploadFile(filePath, collectionId);
+
+    // If title or tags provided, update the created raindrop
+    if ((title || tags) && result.item?._id) {
+      const updateData: Partial<Raindrop> = {};
+      if (title) {updateData.title = title;}
+      if (tags) {updateData.tags = tags;}
+      const updatedResult = await client.updateRaindrop(result.item._id, updateData);
+      return handleMinimalResponse(updatedResult as unknown as JsonValue, minimal);
+    }
+
+    return handleMinimalResponse(result as unknown as JsonValue, minimal);
+  })
+);
+
+// ============================================================================
+// REMINDER TOOLS (Pro feature)
+// ============================================================================
+
+server.registerTool(
+  "set-reminder",
+  {
+    title: "Set Reminder",
+    description: "Set a reminder on a bookmark (Pro feature). You'll receive a notification at the specified date/time. Useful for scheduling follow-ups on articles to read, tasks to complete, or content to revisit.",
+    inputSchema: setReminderSchema,
+  },
+  toolHandler<SetReminderParams>(async ({ raindropId, reminderDate, minimal }) => {
+    // Validate date format
+    const date = new Date(reminderDate);
+    if (isNaN(date.getTime())) {
+      throw new Error(`Invalid date format: ${reminderDate}. Use ISO-8601 format (e.g., '2024-12-31T09:00:00Z')`);
+    }
+
+    const result = await client.updateRaindrop(raindropId, {
+      reminder: { date: date.toISOString() }
+    } as Partial<Raindrop>);
+
+    return handleMinimalResponse(result as unknown as JsonValue, minimal);
+  })
+);
+
+server.registerTool(
+  "remove-reminder",
+  {
+    title: "Remove Reminder",
+    description: "Remove an existing reminder from a bookmark. The bookmark itself is not affected, only the reminder is cleared.",
+    inputSchema: removeReminderSchema,
+  },
+  toolHandler<RemoveReminderParams>(async ({ raindropId, minimal }) => {
+    const result = await client.updateRaindrop(raindropId, {
+      reminder: null
+    } as Partial<Raindrop>);
+
+    return handleMinimalResponse(result as unknown as JsonValue, minimal);
+  })
+);
+
+// ============================================================================
+// HIGHLIGHT CRUD TOOLS
+// ============================================================================
+
+server.registerTool(
+  "create-highlight",
+  {
+    title: "Create Highlight",
+    description: "Add a text highlight/annotation to a bookmark. Highlights are text selections you mark while reading saved content. Each highlight can have a color and optional note. Colors: blue, brown, cyan, gray, green, indigo, orange, pink, purple, red, teal, yellow.",
+    inputSchema: createHighlightSchema,
+  },
+  toolHandler<CreateHighlightParams>(async ({ raindropId, text, color, note, minimal }) => {
+    const result = await client.createHighlight(raindropId, text, color, note);
+    return handleMinimalResponse(result as unknown as JsonValue, minimal);
+  })
+);
+
+server.registerTool(
+  "update-highlight",
+  {
+    title: "Update Highlight",
+    description: "Modify an existing highlight's text, color, or note. Get highlight IDs from the list-highlights tool or get-raindrop with the highlights field.",
+    inputSchema: updateHighlightSchema,
+  },
+  toolHandler<UpdateHighlightParams>(async ({ raindropId, highlightId, text, color, note, minimal }) => {
+    const updates: { text?: string; color?: string; note?: string } = {};
+    if (text !== undefined) {updates.text = text;}
+    if (color !== undefined) {updates.color = color;}
+    if (note !== undefined) {updates.note = note;}
+
+    const result = await client.updateHighlight(raindropId, highlightId, updates);
+    return handleMinimalResponse(result as unknown as JsonValue, minimal);
+  })
+);
+
+server.registerTool(
+  "delete-highlight",
+  {
+    title: "Delete Highlight",
+    description: "Remove a highlight from a bookmark. The bookmark itself is not affected, only the highlight is removed.",
+    inputSchema: deleteHighlightSchema,
+  },
+  toolHandler<DeleteHighlightParams>(async ({ raindropId, highlightId, minimal }) => {
+    const result = await client.deleteHighlight(raindropId, highlightId);
+    return handleMinimalResponse(result as unknown as JsonValue, minimal);
+  })
+);
+
+// ============================================================================
+// TRASH MANAGEMENT TOOLS
+// ============================================================================
+
+server.registerTool(
+  "list-trash",
+  {
+    title: "List Trash",
+    description: "List all bookmarks in the Trash. Items in trash can be restored or permanently deleted. Use empty-trash to permanently delete all items.",
+    inputSchema: listTrashSchema,
+  },
+  toolHandler<ListTrashParams>(async ({ page, perpage, fields }) => {
+    const params: Record<string, JsonPrimitive> = { page, perpage };
+    const result = await client.getRaindrops(TRASH_COLLECTION_ID, params);
+    const filtered = filterApiResponse(result, fields);
+    return createJsonResponse(filtered as JsonValue);
+  })
+);
+
+server.registerTool(
+  "empty-trash",
+  {
+    title: "Empty Trash",
+    description: "Permanently delete ALL items in the Trash. WARNING: This action is IRREVERSIBLE. All trashed bookmarks will be permanently removed from your account. You must set confirm=true to proceed.",
+    inputSchema: emptyTrashSchema,
+  },
+  toolHandler<EmptyTrashParams>(async ({ confirm }) => {
+    if (!confirm) {
+      throw new Error("You must set confirm=true to empty the trash. This action is irreversible.");
+    }
+    await client.emptyTrash();
+    return createSuccessResponse("Trash emptied successfully. All items have been permanently deleted.");
+  })
+);
+
+server.registerTool(
+  "move-to-trash",
+  {
+    title: "Move to Trash",
+    description: "Move a bookmark to the Trash (soft delete). The bookmark can be restored later using restore-from-trash. This is equivalent to the first deletion of a bookmark.",
+    inputSchema: moveToTrashSchema,
+  },
+  toolHandler<MoveToTrashParams>(async ({ raindropId, minimal }) => {
+    const result = await client.updateRaindrop(raindropId, {
+      collection: { $id: TRASH_COLLECTION_ID }
+    });
+    return handleMinimalResponse(result as unknown as JsonValue, minimal);
+  })
+);
+
+server.registerTool(
+  "restore-from-trash",
+  {
+    title: "Restore from Trash",
+    description: "Restore a bookmark from the Trash to a collection. By default, restores to Unsorted (-1). Specify targetCollectionId to restore to a specific collection.",
+    inputSchema: restoreFromTrashSchema,
+  },
+  toolHandler<RestoreFromTrashParams>(async ({ raindropId, targetCollectionId, minimal }) => {
+    const collectionId = targetCollectionId ?? UNSORTED_COLLECTION_ID;
+    const result = await client.updateRaindrop(raindropId, {
+      collection: { $id: collectionId }
+    });
+    return handleMinimalResponse(result as unknown as JsonValue, minimal);
+  })
+);
+
+// ============================================================================
+// IMPORT/EXPORT & BACKUP TOOLS
+// ============================================================================
+
+server.registerTool(
+  "export-collection",
+  {
+    title: "Export Collection",
+    description: "Export bookmarks from a collection to CSV or HTML format. Use collectionId 0 to export all bookmarks. Returns the exported content as text.",
+    inputSchema: exportCollectionSchema,
+  },
+  toolHandler<ExportCollectionParams>(async ({ collectionId, format }) => {
+    const content = await client.exportCollection(collectionId, format);
+    return createSuccessResponse(content);
+  })
+);
+
+server.registerTool(
+  "create-backup",
+  {
+    title: "Create Backup",
+    description: "Trigger a full backup of your Raindrop.io account. This is an async operation - you will receive an email notification when the backup is ready. Use list-backups to see available backups.",
+    inputSchema: createBackupSchema,
+  },
+  toolHandler(async () => {
+    await client.createBackup();
+    return createSuccessResponse("Backup requested. You will receive an email notification when it's ready.");
+  })
+);
+
+server.registerTool(
+  "list-backups",
+  {
+    title: "List Backups",
+    description: "List all available backups for your account. Backups can be downloaded from the Raindrop.io web interface.",
+    inputSchema: listBackupsSchema,
+  },
+  toolHandler(async () => {
+    const result = await client.listBackups();
+    return createJsonResponse(result as unknown as JsonValue);
+  })
+);
+
+server.registerTool(
+  "import-bookmarks-file",
+  {
+    title: "Import Bookmarks File",
+    description: "Import bookmarks from an HTML bookmark file (exported from browsers like Chrome, Firefox, Safari). Optionally specify a collection to import into, otherwise new collections will be created based on the file structure.",
+    inputSchema: importBookmarksFileSchema,
+  },
+  toolHandler<ImportBookmarksFileParams>(async ({ filePath, collectionId }) => {
+    const result = await client.importBookmarksFile(filePath, collectionId);
+    return createJsonResponse(result as unknown as JsonValue);
+  })
+);
+
+// ============================================================================
+// CACHE & WATCH TOOLS (Pro features)
+// ============================================================================
+
+server.registerTool(
+  "get-cache",
+  {
+    title: "Get Cache URL",
+    description: "Get the S3 URL for a bookmark's cached/permanent copy (Pro feature). The permanent copy preserves the page content even if the original URL goes offline. Returns the direct URL to the cached content.",
+    inputSchema: getCacheSchema,
+  },
+  toolHandler<GetCacheParams>(async ({ raindropId }) => {
+    const result = await client.getCacheUrl(raindropId);
+    return createJsonResponse(result as unknown as JsonValue);
+  })
+);
+
+server.registerTool(
+  "watch-collection",
+  {
+    title: "Watch Collection",
+    description: "Poll for new bookmarks added to a collection since the last check. Simulates webhook functionality. First call establishes the baseline, subsequent calls return only new items. Use resetWatch=true to start fresh or provide a custom 'since' timestamp.",
+    inputSchema: watchCollectionSchema,
+  },
+  toolHandler<WatchCollectionParams>(async ({ collectionId, since, resetWatch }) => {
+    const result = await client.watchCollection(collectionId, since, resetWatch);
     return createJsonResponse(result as unknown as JsonValue);
   })
 );
